@@ -1,0 +1,22 @@
+# .github/workflows/deploy.yml: announce each production deploy to Spitfire's synthetic monitors
+name: Deploy
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./deploy.sh   # your own deploy
+      - uses: usespitfire/spitfire-action@v1
+        id: spitfire
+        with:
+          url: https://spitfire.example.com
+          token: ${{ secrets.SPITFIRE_TOKEN }}
+          deploy: true
+          environment: prod
+          deploy-note: ${{ github.repository }}
+      - run: echo "Deploy ${{ steps.spitfire.outputs.deploy-id }}, ${{ steps.spitfire.outputs.deploy-woken }} monitors on close watch"

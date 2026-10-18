@@ -1,5 +1,5 @@
 name: Spitfire load test
-description: Run a load test saved on your self-hosted Spitfire as a performance gate, with a pull request summary.
+description: Run a load test saved on your self-hosted Spitfire as a performance gate, with a pull request summary, and announce deploys to its monitors.
 author: Spitfire
 branding:
   icon: activity
@@ -13,10 +13,24 @@ inputs:
     description: A personal API token (Spitfire → user menu → API tokens). Pass it from a secret.
     required: true
   test:
-    description: The saved test's name or id.
-    required: true
+    description: The saved test's name or id. Leave it out to only announce a deploy (deploy true).
+    required: false
   environment:
-    description: One of the test's environments to run against, e.g. staging.
+    description: One of the test's environments to run against, e.g. staging. With deploy, the monitors of this environment wake.
+    required: false
+  deploy:
+    description: "Announce a deploy to Spitfire first: the synthetic monitors it touches check at once and then every minute for 30 minutes, and each deploy gets a verdict (clean, slower, failing more). true or false."
+    required: false
+    default: "false"
+  deploy-version:
+    description: The deployed version shown on the monitors' trend (default the commit SHA).
+    required: false
+    default: ${{ github.sha }}
+  deploy-note:
+    description: A short note for the deploy, e.g. the service's name.
+    required: false
+  deploy-monitors:
+    description: "Monitor ids to wake, comma or newline separated (default: the monitors of environment, or all you may change)."
     required: false
   compare:
     description: "A comparative run against two of the test's environments at once, e.g. A=prod,B=staging (A the reference, B the candidate)."
@@ -86,17 +100,62 @@ outputs:
   summary:
     description: Path of the run summary JSON.
     value: ${{ steps.run.outputs.summary }}
+  deploy-id:
+    description: With deploy, the id of the announced deploy.
+    value: ${{ steps.deploy.outputs.deploy-id }}
+  deploy-woken:
+    description: With deploy, how many monitors went on close watch.
+    value: ${{ steps.deploy.outputs.woken }}
 
 runs:
   using: composite
   steps:
+    - name: Announce the deploy
+      id: deploy
+      shell: bash
+      env:
+        SF_URL: ${{ inputs.url }}
+        SF_TOKEN: ${{ inputs.token }}
+        SF_INSECURE: ${{ inputs.insecure }}
+        IN_TEST: ${{ inputs.test }}
+        IN_DEPLOY: ${{ inputs.deploy }}
+        IN_ENV: ${{ inputs.environment }}
+        IN_VERSION: ${{ inputs.deploy-version }}
+        IN_NOTE: ${{ inputs.deploy-note }}
+        IN_MONITORS: ${{ inputs.deploy-monitors }}
+      run: |
+        set -euo pipefail
+        if [ "$IN_DEPLOY" != "true" ]; then
+          [ -n "$IN_TEST" ] && exit 0
+          echo "::error::Spitfire: give a test to run, or deploy: true to announce a deploy (or both)."; exit 1
+        fi
+        # JSON strings by hand: no jq or python needed on the runner
+        js() { local v=${1//\\/\\\\}; v=${v//\"/\\\"}; v=${v//$'\n'/ }; v=${v//$'\r'/ }; v=${v//$'\t'/ }; printf '"%s"' "$v"; }
+        ids=""
+        for m in $(echo "$IN_MONITORS" | tr ',' ' '); do ids="${ids:+$ids,}$(js "$m")"; done
+        body="{\"environment\":$(js "$IN_ENV"),\"version\":$(js "$IN_VERSION"),\"note\":$(js "$IN_NOTE")${ids:+,\"monitors\":[$ids]}}"
+        k=""; [ "$SF_INSECURE" = "true" ] && k="-k"
+        out="${RUNNER_TEMP}/spitfire-deploy.json"
+        code="$(curl -sS $k -o "$out" -w '%{http_code}' -X POST "${SF_URL%/}/api/v1/deploys" \
+          -H "Authorization: Bearer ${SF_TOKEN}" -H "Content-Type: application/json" --data "$body")" || code=000
+        if [ "$code" != "202" ] && [ "$code" != "201" ] && [ "$code" != "200" ]; then
+          echo "::error::Spitfire: the deploy could not be announced (HTTP ${code}): $(head -c 300 "$out" 2>/dev/null)"; exit 1
+        fi
+        id="$(grep -o '"id":"[^"]*"' "$out" | head -1 | cut -d'"' -f4 || true)"
+        woken="$(sed -n 's/.*"woken":\[\([^]]*\)\].*/\1/p' "$out" | { grep -o '"id":' || true; } | wc -l | tr -d ' ')"
+        { echo "deploy-id=$id"; echo "woken=${woken:-0}"; } >> "$GITHUB_OUTPUT"
+        echo "Spitfire: deploy ${IN_VERSION} announced; ${woken:-0} monitor(s) on close watch for 30 minutes."
+        echo "Spitfire: deploy \`${IN_VERSION}\` announced, ${woken:-0} monitor(s) on close watch for 30 minutes." >> "$GITHUB_STEP_SUMMARY"
+
     - name: Get the Spitfire CLI from the controller
       shell: bash
       env:
         SF_URL: ${{ inputs.url }}
         SF_INSECURE: ${{ inputs.insecure }}
+        IN_TEST: ${{ inputs.test }}
       run: |
         set -euo pipefail
+        [ -z "$IN_TEST" ] && exit 0  # a deploy announcement only
         case "${RUNNER_OS}/${RUNNER_ARCH}" in
           Linux/X64)     file=spitfire-cli-linux-amd64.gz ;;
           Linux/ARM64)   file=spitfire-cli-linux-arm64.gz ;;
@@ -145,6 +204,7 @@ runs:
         EVENT: ${{ github.event_name }}
       run: |
         set -uo pipefail
+        [ -z "$IN_TEST" ] && exit 0  # a deploy announcement only
         args=(cloud run "$IN_TEST" -o "$IN_SUMMARY" --report-lang "$IN_LANG")
         md="${RUNNER_TEMP}/spitfire-summary.md"
         args+=(--summary-md "$md")

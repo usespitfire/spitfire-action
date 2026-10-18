@@ -65,7 +65,7 @@ def run_action(inputs, step_ids=None, extra_env=None, path_first=None):
 
 
 # 1. the download step: the Linux CLI from the controller, checked against its header
-code, _, _, paths, tmp = run_action({"url": URL, "token": pat, "test": "x"}, step_ids={0})
+code, _, _, paths, tmp = run_action({"url": URL, "token": pat, "test": "x"}, step_ids={1})
 check("download: the Linux CLI with a matching checksum", code == 0 and paths and os.path.exists(os.path.join(paths[0], "spitfire")), code)
 
 # a CLI for this machine stands in for it in the run step
@@ -79,19 +79,36 @@ spec = lambda name, expr: {"name": name, "variables": {"base": os.environ["DOCS_
                            "thresholds": [{"metric": "req_duration", "expr": expr}]}
 call("POST", "/tests", {"spec": spec("action pass", "p(95)<5000"), "description": ""}, tok)
 call("POST", "/tests", {"spec": spec("action fail", "p(95)<0.001"), "description": ""}, tok)
-code, out, summ, _, tmp = run_action({"url": URL, "token": pat, "test": "action pass"}, step_ids={1}, path_first=bindir)
+code, out, summ, _, tmp = run_action({"url": URL, "token": pat, "test": "action pass"}, step_ids={2}, path_first=bindir)
 check("passing test: exit 0, result passed", code == 0 and out.get("exit-code") == "0" and out.get("result") == "passed", (code, out))
 check("passing test: summary JSON written", os.path.exists(os.path.join(tmp, "spitfire-summary.json")), out)
 check("passing test: the job summary has the Markdown", "action pass" in summ or "|" in summ, summ[:200])
 
 # 3. a failing threshold fails the step, and fail: false keeps it green
-code, out, _, _, _ = run_action({"url": URL, "token": pat, "test": "action fail"}, step_ids={1}, path_first=bindir)
+code, out, _, _, _ = run_action({"url": URL, "token": pat, "test": "action fail"}, step_ids={2}, path_first=bindir)
 check("failing threshold: step fails with 99, result failed", code == 99 and out.get("result") == "failed", (code, out))
-code, out, _, _, _ = run_action({"url": URL, "token": pat, "test": "action fail", "fail": "false"}, step_ids={1}, path_first=bindir)
+code, out, _, _, _ = run_action({"url": URL, "token": pat, "test": "action fail", "fail": "false"}, step_ids={2}, path_first=bindir)
 check("fail: false: step passes, exit-code 99 recorded", code == 0 and out.get("exit-code") == "99", (code, out))
 
 # 4. inputs reach the CLI: vars, runners, scale (an unknown test is an error, exit 1)
-code, out, _, _, _ = run_action({"url": URL, "token": pat, "test": "no such test", "vars": "a=1\n b = 2 \n", "scale": "0.5"}, step_ids={1}, path_first=bindir)
+code, out, _, _, _ = run_action({"url": URL, "token": pat, "test": "no such test", "vars": "a=1\n b = 2 \n", "scale": "0.5"}, step_ids={2}, path_first=bindir)
 check("unknown test: exit 1, result error", code == 1 and out.get("result") == "error", (code, out))
+
+# 5. deploy: announce only (no test), every monitor the token's user may change
+code, out, summ, paths, _ = run_action({"url": URL, "token": pat, "deploy": "true", "deploy-version": "v9.9.9", "deploy-note": 'say "hi"\\'})
+check("deploy only: step passes, an id and woken monitors", code == 0 and len(out.get("deploy-id", "")) == 36 and int(out.get("woken", "0")) >= 1, (code, out))
+check("deploy only: the CLI is not downloaded", not paths, paths)
+check("deploy only: the job summary says so", "v9.9.9" in summ, summ)
+deploys = call("GET", "/deploys", None, tok)["data"]
+last = next((d for d in deploys if d["id"] == out.get("deploy-id")), None)
+check("deploy only: the version and note arrive as written", last and last["version"] == "v9.9.9" and last["note"] == 'say "hi"\\', last)
+
+# 6. an environment no monitor has wakes none, still announced
+code, out, _, _, _ = run_action({"url": URL, "token": pat, "deploy": "true", "environment": "no-such-env"}, step_ids={0})
+check("deploy, unknown environment: announced, 0 woken", code == 0 and out.get("woken") == "0", (code, out))
+
+# 7. neither a test nor deploy: an error before anything runs
+code, out, _, _, _ = run_action({"url": URL, "token": pat})
+check("no test, no deploy: step fails", code == 1 and not out, (code, out))
 
 sys.exit(1 if fails else 0)
