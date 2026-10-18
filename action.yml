@@ -1,5 +1,5 @@
 name: Spitfire load test
-description: Run a load test saved on your self-hosted Spitfire as a performance gate, with a pull request summary, and announce deploys to its monitors.
+description: Run a load test saved on your self-hosted Spitfire as a performance gate, with a pull request summary, announce deploys to its monitors and put them in planned maintenance.
 author: Spitfire
 branding:
   icon: activity
@@ -13,10 +13,10 @@ inputs:
     description: A personal API token (Spitfire → user menu → API tokens). Pass it from a secret.
     required: true
   test:
-    description: The saved test's name or id. Leave it out to only announce a deploy (deploy true).
+    description: The saved test's name or id. Leave it out to only announce a deploy (deploy true) or set a maintenance.
     required: false
   environment:
-    description: One of the test's environments to run against, e.g. staging. With deploy, the monitors of this environment wake.
+    description: One of the test's environments to run against, e.g. staging. With deploy or maintenance, the monitors of this environment.
     required: false
   deploy:
     description: "Announce a deploy to Spitfire first: the synthetic monitors it touches check at once and then every minute for 30 minutes, and each deploy gets a verdict (clean, slower, failing more). true or false."
@@ -30,7 +30,13 @@ inputs:
     description: A short note for the deploy, e.g. the service's name.
     required: false
   deploy-monitors:
-    description: "Monitor ids to wake, comma or newline separated (default: the monitors of environment, or all you may change)."
+    description: "Monitor ids to wake or put in maintenance, comma or newline separated (default: the monitors of environment, or all you may change)."
+    required: false
+  maintenance:
+    description: "Planned maintenance for the monitors (Spitfire 0.51+): minutes (1-1440) to start it, during which their checks are skipped and nothing alerts; or end to end it (they check at once). Runs before deploy, so maintenance end and deploy true go together."
+    required: false
+  maintenance-note:
+    description: Why, shown on the monitors' pages (default deploy-note).
     required: false
   compare:
     description: "A comparative run against two of the test's environments at once, e.g. A=prod,B=staging (A the reference, B the candidate)."
@@ -106,10 +112,51 @@ outputs:
   deploy-woken:
     description: With deploy, how many monitors went on close watch.
     value: ${{ steps.deploy.outputs.woken }}
+  maintenance-until:
+    description: With maintenance minutes, when it ends (RFC 3339); empty when ended.
+    value: ${{ steps.maintenance.outputs.until }}
 
 runs:
   using: composite
   steps:
+    - name: Planned maintenance
+      id: maintenance
+      shell: bash
+      env:
+        SF_URL: ${{ inputs.url }}
+        SF_TOKEN: ${{ inputs.token }}
+        SF_INSECURE: ${{ inputs.insecure }}
+        IN_MAINT: ${{ inputs.maintenance }}
+        IN_ENV: ${{ inputs.environment }}
+        IN_NOTE: ${{ inputs.maintenance-note || inputs.deploy-note }}
+        IN_MONITORS: ${{ inputs.deploy-monitors }}
+      run: |
+        set -euo pipefail
+        [ -z "$IN_MAINT" ] && exit 0
+        case "$IN_MAINT" in
+          end) minutes=0 ;;
+          *[!0-9]*) echo "::error::Spitfire: maintenance is a number of minutes (1-1440) or end, not '${IN_MAINT}'."; exit 1 ;;
+          *) minutes=$((10#$IN_MAINT))
+             [ "$minutes" -gt 0 ] || { echo "::error::Spitfire: maintenance: give 1-1440 minutes, or end."; exit 1; } ;;
+        esac
+        js() { local v=${1//\\/\\\\}; v=${v//\"/\\\"}; v=${v//$'\n'/ }; v=${v//$'\r'/ }; v=${v//$'\t'/ }; printf '"%s"' "$v"; }
+        ids=""
+        for m in $(echo "$IN_MONITORS" | tr ',' ' '); do ids="${ids:+$ids,}$(js "$m")"; done
+        body="{\"environment\":$(js "$IN_ENV"),\"minutes\":${minutes},\"note\":$(js "$IN_NOTE")${ids:+,\"monitors\":[$ids]}}"
+        k=""; [ "$SF_INSECURE" = "true" ] && k="-k"
+        out="${RUNNER_TEMP}/spitfire-maintenance.json"
+        code="$(curl -sS $k -o "$out" -w '%{http_code}' -X POST "${SF_URL%/}/api/v1/maintenance" \
+          -H "Authorization: Bearer ${SF_TOKEN}" -H "Content-Type: application/json" --data "$body")" || code=000
+        if [ "$code" != "200" ]; then
+          echo "::error::Spitfire: the maintenance could not be set (HTTP ${code}): $(head -c 300 "$out" 2>/dev/null)"; exit 1
+        fi
+        until="$(grep -o '"until":"[^"]*"' "$out" | head -1 | cut -d'"' -f4 || true)"
+        n="$({ grep -o '"id":' "$out" || true; } | wc -l | tr -d ' ')"
+        echo "until=$until" >> "$GITHUB_OUTPUT"
+        if [ "$minutes" -gt 0 ]; then msg="${n:-0} monitor(s) in planned maintenance until ${until}."; else msg="planned maintenance ended for ${n:-0} monitor(s); they check at once."; fi
+        echo "Spitfire: $msg"
+        echo "Spitfire: $msg" >> "$GITHUB_STEP_SUMMARY"
+
     - name: Announce the deploy
       id: deploy
       shell: bash
@@ -118,6 +165,7 @@ runs:
         SF_TOKEN: ${{ inputs.token }}
         SF_INSECURE: ${{ inputs.insecure }}
         IN_TEST: ${{ inputs.test }}
+        IN_MAINT: ${{ inputs.maintenance }}
         IN_DEPLOY: ${{ inputs.deploy }}
         IN_ENV: ${{ inputs.environment }}
         IN_VERSION: ${{ inputs.deploy-version }}
@@ -126,8 +174,8 @@ runs:
       run: |
         set -euo pipefail
         if [ "$IN_DEPLOY" != "true" ]; then
-          [ -n "$IN_TEST" ] && exit 0
-          echo "::error::Spitfire: give a test to run, or deploy: true to announce a deploy (or both)."; exit 1
+          { [ -n "$IN_TEST" ] || [ -n "$IN_MAINT" ]; } && exit 0
+          echo "::error::Spitfire: give a test to run, deploy: true to announce a deploy, or a maintenance (or several)."; exit 1
         fi
         # JSON strings by hand: no jq or python needed on the runner
         js() { local v=${1//\\/\\\\}; v=${v//\"/\\\"}; v=${v//$'\n'/ }; v=${v//$'\r'/ }; v=${v//$'\t'/ }; printf '"%s"' "$v"; }
@@ -155,7 +203,7 @@ runs:
         IN_TEST: ${{ inputs.test }}
       run: |
         set -euo pipefail
-        [ -z "$IN_TEST" ] && exit 0  # a deploy announcement only
+        [ -z "$IN_TEST" ] && exit 0  # a deploy announcement or a maintenance only
         case "${RUNNER_OS}/${RUNNER_ARCH}" in
           Linux/X64)     file=spitfire-cli-linux-amd64.gz ;;
           Linux/ARM64)   file=spitfire-cli-linux-arm64.gz ;;
@@ -204,7 +252,7 @@ runs:
         EVENT: ${{ github.event_name }}
       run: |
         set -uo pipefail
-        [ -z "$IN_TEST" ] && exit 0  # a deploy announcement only
+        [ -z "$IN_TEST" ] && exit 0  # a deploy announcement or a maintenance only
         args=(cloud run "$IN_TEST" -o "$IN_SUMMARY" --report-lang "$IN_LANG")
         md="${RUNNER_TEMP}/spitfire-summary.md"
         args+=(--summary-md "$md")

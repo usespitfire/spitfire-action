@@ -1,0 +1,31 @@
+# .github/workflows/maintenance.yml: quiet Spitfire's synthetic monitors during a deploy with downtime,
+# then end the maintenance and announce the deploy (Spitfire 0.51+)
+name: Deploy with maintenance
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: usespitfire/spitfire-action@v1
+        id: quiet
+        with:
+          url: https://spitfire.example.com
+          token: ${{ secrets.SPITFIRE_TOKEN }}
+          maintenance: 30          # minutes; a safety net if the job dies before the end step
+          environment: prod
+          maintenance-note: database migration
+      - run: echo "Monitors quiet until ${{ steps.quiet.outputs.maintenance-until }}"
+      - run: ./deploy.sh   # your own deploy
+      - uses: usespitfire/spitfire-action@v1
+        if: always()       # end the maintenance even when the deploy failed
+        with:
+          url: https://spitfire.example.com
+          token: ${{ secrets.SPITFIRE_TOKEN }}
+          maintenance: end
+          deploy: true
+          environment: prod
+          deploy-note: ${{ github.repository }}

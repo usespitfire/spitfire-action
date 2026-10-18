@@ -45,6 +45,32 @@ slower, failing more) with a marker on the trend. Without `test`, the action onl
 
 With both `deploy: true` and `test`, the deploy is announced first, then the test runs.
 
+## Planned maintenance
+
+`maintenance: 60` puts the monitors in planned maintenance for 60 minutes (1–1440): their checks are skipped
+(and left out of uptime, SLO and deploy verdicts) and nothing alerts. `maintenance: end` ends it and they
+check at once. It runs before the deploy announcement, so a deploy job can quiet the monitors at the start and
+end the maintenance together with `deploy: true` at the end. Needs Spitfire 0.51 or later.
+
+```yaml
+      - uses: usespitfire/spitfire-action@v1
+        with:
+          url: https://spitfire.example.com
+          token: ${{ secrets.SPITFIRE_TOKEN }}
+          maintenance: 30
+          environment: prod
+          maintenance-note: database migration
+      # … the deploy …
+      - uses: usespitfire/spitfire-action@v1
+        if: always()
+        with:
+          url: https://spitfire.example.com
+          token: ${{ secrets.SPITFIRE_TOKEN }}
+          maintenance: end
+          deploy: true
+          environment: prod
+```
+
 ## Setup
 
 1. In Spitfire: user menu (top right) → **API tokens** → **Create token**.
@@ -61,12 +87,14 @@ the SHA-256 the controller sends.
 |---|---|---|
 | `url` | required | The controller's URL |
 | `token` | required | A personal API token (from a secret) |
-| `test` | | The saved test's name or id (leave out with `deploy: true` to only announce) |
+| `test` | | The saved test's name or id (leave out to only announce a deploy or set a maintenance) |
 | `environment` | | One of the test's environments, e.g. `staging`; with `deploy`, the monitors of this environment wake |
 | `deploy` | `false` | `true` announces a deploy to the monitors first |
 | `deploy-version` | `github.sha` | The version shown on the monitors' trend |
 | `deploy-note` | | A short note, e.g. the service's name |
-| `deploy-monitors` | | Monitor ids to wake, comma or newline separated |
+| `deploy-monitors` | | Monitor ids to wake or put in maintenance, comma or newline separated |
+| `maintenance` | | Minutes (1–1440) of planned maintenance, or `end` (Spitfire 0.51+) |
+| `maintenance-note` | `deploy-note` | Why, shown on the monitors' pages |
 | `compare` | | Compare two environments at the same time: `A=prod,B=staging` (A the reference, B the candidate) |
 | `runners` | `1` | Idle runners to use (ignored with `locations`) |
 | `locations` | | One per line: `name=percent[:runners]`, e.g. `istanbul=60:2` |
@@ -93,9 +121,10 @@ the SHA-256 the controller sends.
 | `summary` | Path of the summary JSON |
 | `deploy-id` | With `deploy`: the announced deploy's id |
 | `deploy-woken` | With `deploy`: how many monitors went on close watch |
+| `maintenance-until` | With `maintenance` minutes: when it ends (RFC 3339); empty when ended |
 
 More examples: [`examples/`](examples) (a pull request gate with the report as an artifact, a release
-comparison across two locations, a deploy announcement). Documentation: [CI/CD with Spitfire](https://usespitfire.com/docs/ci-cd).
+comparison across two locations, a deploy announcement, a deploy in planned maintenance). Documentation: [CI/CD with Spitfire](https://usespitfire.com/docs/ci-cd).
 
 Runners: Linux (x64, arm64) and Windows (x64).
 
@@ -104,7 +133,8 @@ Runners: Linux (x64, arm64) and Windows (x64).
 `test/local.py` runs the action's steps against a live Spitfire as GitHub would (inputs and defaults,
 `GITHUB_OUTPUT`, `GITHUB_STEP_SUMMARY`, `GITHUB_PATH`): the CLI download and its checksum, a passing test,
 a failing threshold with `fail` true and false, an unknown test, and a deploy announcement (alone, for an
-environment, and the error when neither a test nor `deploy` is given).
+environment, and the error when neither a test nor `deploy` is given), and planned maintenance (start with
+the note, end together with a deploy, a bad value and over 1440 minutes refused).
 
 ## License
 
